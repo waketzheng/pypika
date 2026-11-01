@@ -28,6 +28,13 @@ class UpdateTests(unittest.TestCase):
 
         self.assertEqual("UPDATE \"abc\" SET \"1\"=ARRAY[1,'a',true]", str(q))
 
+    def test_backslashes_in_values_are_literal(self):
+        # PostgreSQL treats a backslash as a literal character in string literals,
+        # so values are left untouched
+        q = PostgreSQLQuery.update(self.table_abc).set("foo", "bar\\")
+
+        self.assertEqual("UPDATE \"abc\" SET \"foo\"='bar\\'", str(q))
+
 
 class JSONObjectTests(unittest.TestCase):
     def test_alias_set_correctly(self):
@@ -50,6 +57,11 @@ class JSONObjectTests(unittest.TestCase):
         q = PostgreSQLQuery.select(JSON(["a", "b", "c"]))
 
         self.assertEqual('SELECT \'["a","b","c"]\'', str(q))
+
+    def test_json_boolean_and_null_values(self):
+        q = PostgreSQLQuery.select(JSON({"enabled": True, "values": [False, None]}))
+
+        self.assertEqual('SELECT \'{"enabled":true,"values":[false,null]}\'', str(q))
 
     def test_json_value_from_dict_recursive(self):
         q = PostgreSQLQuery.select(JSON({"a": "z", "b": {"c": "foo"}, "d": 1}))

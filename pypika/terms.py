@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import inspect
 import re
 import sys
@@ -7,6 +8,7 @@ import uuid
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import date, datetime, time
 from enum import Enum
+from ipaddress import IPv4Address, IPv6Address
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
@@ -14,6 +16,7 @@ from pypika.utils import (
     CaseException,
     FunctionException,
     builder,
+    escape_backslashes,
     format_alias_sql,
     format_quotes,
     ignore_copy,
@@ -137,7 +140,7 @@ class Term(Node):
 
         return JSON(val)
 
-    def replace_table(self, current_table: Table | None, new_table: Table | None) -> Term:
+    def replace_table(self, current_table: Table | None, new_table: Table | None) -> Self:
         """
         Replaces all occurrences of the specified table with the new table. Useful when reusing fields across queries.
         The base implementation returns self because not all terms have a table property.
@@ -243,7 +246,7 @@ class Term(Node):
     def __invert__(self) -> Not:
         return Not(self)
 
-    def __pos__(self) -> Term:
+    def __pos__(self) -> Self:
         return self
 
     def __neg__(self) -> Negative:
@@ -346,10 +349,10 @@ class Parameter(Term):
     def get_sql(self, **kwargs: Any) -> str:
         return str(self.placeholder)
 
-    def update_parameters(self, param_key: Any, param_value: Any, **kwargs):
+    def update_parameters(self, param_key: Any, param_value: Any, **kwargs) -> None:
         pass
 
-    def get_param_key(self, placeholder: Any, **kwargs):
+    def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder
 
 
@@ -365,10 +368,10 @@ class ListParameter(Parameter):
 
         return str(self._placeholder)
 
-    def get_parameters(self, **kwargs):
+    def get_parameters(self, **kwargs) -> list:
         return self._parameters
 
-    def update_parameters(self, value: Any, **kwargs):
+    def update_parameters(self, value: Any, **kwargs) -> None:
         self._parameters.append(value)
 
 
@@ -384,18 +387,18 @@ class DictParameter(Parameter):
 
         return str(self._placeholder)
 
-    def get_parameters(self, **kwargs):
+    def get_parameters(self, **kwargs) -> dict:
         return self._parameters
 
-    def get_param_key(self, placeholder: Any, **kwargs):
+    def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder[1:]
 
-    def update_parameters(self, param_key: Any, value: Any, **kwargs):
+    def update_parameters(self, param_key: Any, value: Any, **kwargs) -> None:
         self._parameters[param_key] = value
 
 
 class QmarkParameter(ListParameter):
-    def get_sql(self, **kwargs):
+    def get_sql(self, **kwargs) -> str:
         return '?'
 
 
@@ -426,7 +429,7 @@ class PyformatParameter(DictParameter):
     def get_sql(self, **kwargs: Any) -> str:
         return "%({placeholder})s".format(placeholder=self.placeholder)
 
-    def get_param_key(self, placeholder: Any, **kwargs):
+    def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder[2:-2]
 
 
@@ -439,8 +442,23 @@ class Negative(Term):
     def is_aggregate(self) -> bool | None:
         return self.term.is_aggregate
 
-    def get_sql(self, **kwargs: Any) -> str:
-        return "-{term}".format(term=self.term.get_sql(**kwargs))
+    def get_sql(self, with_alias: bool = False, **kwargs: Any) -> str:
+        term = self.term
+        if term.alias is not None:
+            # Some terms render their alias even without with_alias=True.
+            term = copy.copy(term)
+            term.alias = None
+        term_sql = term.get_sql(**kwargs)
+        # Preserve the operand's grouping and avoid turning consecutive minus
+        # signs into a SQL comment, including when the operand is a literal.
+        if isinstance(self.term, ArithmeticExpression) or term_sql.startswith("-"):
+            term_sql = "({})".format(term_sql)
+        sql = "-{}".format(term_sql)
+        if with_alias:
+            # Keep operand aliases outside the parentheses, as result aliases.
+            alias = self.alias if self.alias is not None else self.term.alias
+            return format_alias_sql(sql, alias, **kwargs)
+        return sql
 
 
 class ValueWrapper(Term):
@@ -454,7 +472,7 @@ class ValueWrapper(Term):
         return self.get_formatted_value(self.value, **kwargs)
 
     @classmethod
-    def get_formatted_value(cls, value: Any, **kwargs):
+    def get_formatted_value(cls, value: Any, **kwargs) -> str:
         quote_char = kwargs.get("secondary_quote_char") or ""
 
         if isinstance(value, Term):
@@ -464,10 +482,18 @@ class ValueWrapper(Term):
         if isinstance(value, (date, datetime, time)):
             return cls.get_formatted_value(value.isoformat(), **kwargs)
         if isinstance(value, str):
+            # MySQL and ClickHouse treat a backslash as an escape character in
+            # string literals by default, so it must be doubled for the value to
+            # round-trip; otherwise a trailing backslash would escape the closing
+            # quote. Other dialects treat it literally, so it is left untouched.
+            # When the value is being collected for a bound parameter it is NOT
+            # an SQL literal, so it must not be escaped.
+            if not kwargs.get("within_parameter"):
+                value = escape_backslashes(value, kwargs.get("dialect"))
             return format_quotes(value, quote_char)
         if isinstance(value, bool):
             return str.lower(str(value))
-        if isinstance(value, uuid.UUID):
+        if isinstance(value, (uuid.UUID, IPv4Address, IPv6Address)):
             return cls.get_formatted_value(str(value), **kwargs)
         if value is None:
             return "null"
@@ -494,7 +520,10 @@ class ValueWrapper(Term):
         if isinstance(self.value, (int, float)):
             value_sql = self.value
         else:
-            value_sql = self.get_value_sql(quote_char=quote_char, **kwargs)
+            # Mark that the value is collected for a bound parameter, so value
+            # escaping that only applies to SQL literals (e.g. backslash escaping)
+            # is skipped; the bound value must be the original value.
+            value_sql = self.get_value_sql(quote_char=quote_char, within_parameter=True, **kwargs)
         param_sql, param_key = self._get_param_data(parameter, **kwargs)
         parameter.update_parameters(param_key=param_key, value=value_sql, **kwargs)
 
@@ -527,6 +556,10 @@ class JSON(Term):
             return self._get_list_sql(value, **kwargs)
         if isinstance(value, str):
             return self._get_str_sql(value, **kwargs)
+        if isinstance(value, bool):
+            return str(value).lower()
+        if value is None:
+            return "null"
         return str(value)
 
     def _get_dict_sql(self, value: dict, **kwargs: Any) -> str:
@@ -654,16 +687,16 @@ class EmptyCriterion(Criterion):
     def fields_(self) -> set[Field]:
         return set()
 
-    def __and__(self, other: Any) -> Any:
+    def __and__(self, other: T) -> T:
         return other
 
-    def __or__(self, other: Any) -> Any:
+    def __or__(self, other: T) -> T:
         return other
 
-    def __xor__(self, other: Any) -> Any:
+    def __xor__(self, other: T) -> T:
         return other
 
-    def __invert__(self) -> Any:
+    def __invert__(self) -> Self:
         return self
 
 
@@ -899,6 +932,7 @@ class BasicCriterion(Criterion):
         self.right = self.right.replace_table(current_table, new_table)
 
     def get_sql(self, quote_char: str = '"', with_alias: bool = False, **kwargs: Any) -> str:
+        kwargs["subcriterion"] = True
         sql = "{left}{comparator}{right}".format(
             comparator=self.comparator.value,
             left=self.left.get_sql(quote_char=quote_char, **kwargs),
@@ -968,12 +1002,12 @@ class ExistsCriterion(Criterion):
         self.container = container
         self._is_negated = False
 
-    def get_sql(self, **kwargs):
+    def get_sql(self, **kwargs) -> str:
         return "{not_}EXISTS {container}".format(
             container=self.container.get_sql(**kwargs), not_='NOT ' if self._is_negated else ''
         )
 
-    def negate(self):
+    def negate(self) -> Self:
         self._is_negated = True
         return self
 
@@ -1317,7 +1351,7 @@ class Case(Criterion):
         self._else = self._else.replace_table(current_table, new_table) if self._else else None
 
     @builder
-    def else_(self, term: Any) -> Case:
+    def else_(self, term: Any) -> Self:
         self._else = self.wrap_constant(term)
         return self
 
@@ -1421,10 +1455,10 @@ class CustomFunction:
 
         return Function(self.name, *args, alias=kwargs.get("alias"))
 
-    def _has_params(self):
+    def _has_params(self) -> bool:
         return self.params is not None
 
-    def _is_valid_function_call(self, *args):
+    def _is_valid_function_call(self, *args) -> bool:
         return len(args) == len(self.params)
 
 
@@ -1816,7 +1850,7 @@ class AtTimezone(Term):
         self.zone = zone
         self.interval = interval
 
-    def get_sql(self, **kwargs):
+    def get_sql(self, **kwargs) -> str:
         sql = '{name} AT TIME ZONE {interval}\'{zone}\''.format(
             name=self.field.get_sql(**kwargs),
             interval='INTERVAL ' if self.interval else '',
