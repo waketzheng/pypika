@@ -98,7 +98,8 @@ class Term(Node):
 
     @staticmethod
     def wrap_constant(
-        val: Node | list | tuple | Any | None, wrapper_cls: type[Term] | None = None
+        val: Node | list | tuple | Any | None,
+        wrapper_cls: type[Term] | None = None,
     ) -> Node | NullValue | Array | Tuple | ValueWrapper | Term:
         """
         Used for wrapping raw inputs such as numbers in Criterions and Operator.
