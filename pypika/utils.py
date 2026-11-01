@@ -5,6 +5,8 @@ from collections.abc import Callable
 from functools import wraps
 from typing import Any, TypeVar, overload
 
+from pypika.enums import Dialects
+
 if sys.version_info >= (3, 10):
     from typing import Concatenate, ParamSpec
 else:
@@ -103,7 +105,7 @@ def ignore_copy(func: Callable[[_Self, str], R]) -> Callable[[_Self, str], R]:
             "__setstate__",
             "__getnewargs__",
         ]:
-            raise AttributeError("'%s' object has no attribute '%s'" % (self.__class__.__name__, name))
+            raise AttributeError(f"{self.__class__.__name__!r} object has no attribute {name!r}")
 
         return func(self, name)
 
@@ -132,6 +134,22 @@ def format_quotes(value: Any, quote_char: str | None) -> str:
     return "{quote}{value}{quote}".format(value=value, quote=quote_char or "")
 
 
+def escape_backslashes(value: str, dialect: Dialects | None) -> str:
+    """
+    Doubles backslashes in a string value for dialects that treat a backslash as
+    an escape character in string literals (MySQL and ClickHouse). There a trailing
+    backslash would otherwise escape the closing quote of the literal, producing
+    invalid SQL. Dialects that treat backslashes literally (PostgreSQL, SQLite,
+    MSSQL, ...) are left untouched.
+
+    Server-side modes such as MySQL's NO_BACKSLASH_ESCAPES cannot be detected
+    client-side; escaping follows the dialects' default mode.
+    """
+    if dialect in (Dialects.MYSQL, Dialects.CLICKHOUSE):
+        return value.replace("\\", "\\\\")
+    return value
+
+
 def format_alias_sql(
     sql: str,
     alias: str | None,
@@ -151,4 +169,6 @@ def validate(*args: Any, exc: Exception | None = None, type: type | None = None)
     if type is not None:
         for arg in args:
             if not isinstance(arg, type):
+                if exc is None:
+                    raise ValueError(f"Expected {arg!r} to be {type}")
                 raise exc
