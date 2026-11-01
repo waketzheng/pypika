@@ -126,7 +126,8 @@ class Term(Node):
 
     @staticmethod
     def wrap_json(
-        val: Term | QueryBuilder | str | int | bool | Any | None, wrapper_cls: type[T] | Any | None = None
+        val: Term | QueryBuilder | str | int | bool | Any | None,
+        wrapper_cls: type[T] | Any | None = None,
     ) -> Term | QueryBuilder | NullValue | ValueWrapper | T | JSON:
         from .queries import QueryBuilder
 
